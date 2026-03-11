@@ -2,44 +2,64 @@ import subprocess
 import os
 import shutil
 import threading
+from pathlib import Path
+
 
 class PiperEngine:
     def __init__(self):
-        self.voice_dir = os.path.join(os.path.dirname(__file__), "voices")
-        self.current_process = None    # TTS generation
-        self.play_process = None       # Audio playback
+        self.voice_dir = Path(__file__).parent / "voices"
+        self.current_process: subprocess.Popen | None = None
+        self.play_process: subprocess.Popen | None = None
         self.mute = False
-        self.lock = threading.Lock()   # Protect process access
+        self.lock = threading.Lock()
 
-        # Detect backend
-        self.pipewire = self._detect_pipewire()
+        self.pipewire = self._is_pipewire()
         self.paplay_cmd = "pw-play" if self.pipewire else "paplay"
-
-        # Check if sox exists (we won't use pitch anymore)
         self.has_sox = shutil.which("sox") is not None
 
-    def _detect_pipewire(self):
+    def _is_pipewire(self) -> bool:
         try:
-            subprocess.check_output(["pw-cli", "info"], stderr=subprocess.DEVNULL)
+            subprocess.check_output(["pw-cli", "info"], stderr=subprocess.DEVNULL, timeout=2)
             return True
         except Exception:
             return False
 
     def stop(self):
-        """Stop TTS immediately."""
+        """Force-stop all synthesis and playback processes."""
         with self.lock:
+            # Kill synthesis
             if self.current_process and self.current_process.poll() is None:
-                self.current_process.terminate()
+                try:
+                    self.current_process.terminate()
+                    self.current_process.wait(timeout=0.3)
+                except:
+                    self.current_process.kill()
+                    self.current_process.wait(timeout=0.3)
                 self.current_process = None
+
+            # Kill playback
             if self.play_process and self.play_process.poll() is None:
-                self.play_process.terminate()
+                try:
+                    self.play_process.terminate()
+                    self.play_process.wait(timeout=0.3)
+                except:
+                    self.play_process.kill()
+                    self.play_process.wait(timeout=0.3)
                 self.play_process = None
+
+        # Last-resort: kill any lingering piper or pw-play processes by name
+        try:
+            subprocess.run(["pkill", "-9", "-f", "piper-tts"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run(["pkill", "-9", "-f", self.paplay_cmd], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except:
+            pass
 
     def set_mute(self, state: bool):
         self.mute = state
-        self.stop()  # stop any ongoing audio
+        if state:
+            self.stop()
 
-    def _run(self, text, settings):
+    def _run(self, text: str, settings: dict):
         if self.mute or not text.strip():
             return
 
@@ -49,88 +69,81 @@ class PiperEngine:
         volume = settings.get("volume", 1.0)
         output_device = settings.get("output_device", "default")
 
-        model_path = os.path.join(self.voice_dir, f"{voice}.onnx")
-        tmp_file = "/tmp/piper_output.wav"
+        model_path = self.voice_dir / f"{voice}.onnx"
+        tmp_wav = Path("/tmp/piper_output.wav")
 
-        if not os.path.isfile(model_path):
-            print("Model file not found:", model_path)
+        if not model_path.is_file():
+            print(f"Model file not found: {model_path}")
             return
 
-        # --- Generate TTS ---
+        piper_cmd = [
+            "piper-tts",
+            "--model", str(model_path),
+            "--length_scale", str(speed),
+            "--noise_scale", str(noise),
+            "--noise_w", str(noise),
+            "--output_file", str(tmp_wav),
+        ]
+
         try:
             with self.lock:
-                self.current_process = subprocess.Popen(
-                    [
-                        "piper-tts",
-                        "--model", model_path,
-                        "--length_scale", str(speed),
-                        "--noise_scale", str(noise),
-                        "--noise_w", str(noise),
-                        "--output_file", tmp_file
-                    ],
+                proc = subprocess.Popen(
+                    piper_cmd,
                     stdin=subprocess.PIPE,
-                    text=True
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE
                 )
-            self.current_process.communicate(input=text)
+                self.current_process = proc
+
+            stdout, stderr = proc.communicate(input=text, timeout=60)
+
+            if proc.returncode != 0:
+                print(f"Piper failed (exit {proc.returncode}): {stderr.decode().strip()}")
+                return
+
+            if not tmp_wav.is_file():
+                print("No WAV file created!")
+                return
+
+            # Playback
+            if self.has_sox and abs(volume - 1.0) > 0.001:
+                sox_cmd = ["sox", str(tmp_wav), "-t", "wav", "-", "vol", str(volume)]
+                play_cmd = [self.paplay_cmd, "-"]
+
+                if output_device != "default" and not self.pipewire:
+                    play_cmd += ["--device", output_device]
+
+                with self.lock:
+                    sox = subprocess.Popen(sox_cmd, stdout=subprocess.PIPE)
+                    play_proc = subprocess.Popen(play_cmd, stdin=sox.stdout)
+                    sox.stdout.close()
+
+                play_proc.wait()
+                sox.wait()
+            else:
+                cmd = [self.paplay_cmd, str(tmp_wav)]
+                if output_device != "default" and not self.pipewire:
+                    cmd += ["--device", output_device]
+
+                with self.lock:
+                    play_proc = subprocess.Popen(cmd)
+                play_proc.wait()
+
+        except subprocess.TimeoutExpired:
+            print("Generation or playback timed out")
+            self.stop()
         except Exception as e:
-            print("TTS generation failed:", e)
-            return
+            print(f"Playback error: {e}")
+            self.stop()
+
         finally:
             with self.lock:
                 self.current_process = None
-
-        if not os.path.isfile(tmp_file):
-            print("ERROR: WAV file was not created!")
-            return
-# --- Playback ---
-        try:
-            play_cmd = [self.paplay_cmd, tmp_file]
-
-            if output_device != "default":
-                if self.pipewire:
-                    # PipeWire: pw-play doesn't have --device; we rely on target node or properties
-                    # For specific sink, you may need to set PW_TARGET or use pactl/ wpctl to move stream
-                    # Simplest for now: just play to default and let user choose sink via UI / system
-                    pass  # ← pw-play ignores --device; remove or ignore
-                else:
-                    play_cmd += ["--device", output_device]
-
-            if self.has_sox and abs(volume - 1.0) > 0.001:  # avoid tiny float diffs
-                # Use sox to adjust volume → output to stdout → pipe to pw-play -
-                sox_cmd = [
-                    "sox",
-                    tmp_file,
-                    "-t", "wav",
-                    "-",                # output to stdout
-                    "vol", str(volume)
-                ]
-
-                # Run sox → pipe stdout → pw-play stdin
-                with self.lock:
-                    sox_proc = subprocess.Popen(sox_cmd, stdout=subprocess.PIPE)
-                    self.play_process = subprocess.Popen(
-                        play_cmd + ["-"],  # pw-play reads from stdin
-                        stdin=sox_proc.stdout
-                    )
-                    sox_proc.stdout.close()  # allow sox to receive SIGPIPE if needed
-
-                # Wait on the play process (sox will finish first)
-                self.play_process.wait()
-                sox_proc.wait()  # clean up
-            else:
-                # Direct playback, no sox
-                with self.lock:
-                    self.play_process = subprocess.Popen(play_cmd)
-                self.play_process.wait()
-
-        except Exception as e:
-            print("Playback failed:", e)
-        finally:
-            with self.lock:
                 self.play_process = None
 
-        # Optional: clean up temp file
-        try:
-            os.unlink(tmp_file)
-        except:
-            pass
+            if tmp_wav.exists():
+                try:
+                    tmp_wav.unlink()
+                except:
+                    pass
