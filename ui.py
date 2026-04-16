@@ -32,15 +32,38 @@ class PiperUI(Gtk.Application):
         main_box.set_margin_start(24)
         main_box.set_margin_end(24)
 
+        # Text input area
         scroll = Gtk.ScrolledWindow(vexpand=True)
-        self.text_view = Gtk.TextView(wrap_mode=Gtk.WrapMode.WORD_CHAR)
+        self.text_view = Gtk.TextView()
+        self.text_view.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+        self.text_view.set_editable(True)
+        self.text_view.set_cursor_visible(True)
+        self.text_view.set_pixels_above_lines(8)
+        self.text_view.set_pixels_below_lines(8)
+        self.text_view.set_left_margin(12)
+        self.text_view.set_right_margin(12)
+
+        self.text_view.set_input_hints(Gtk.InputHints.NONE)
+        self.text_view.set_input_purpose(Gtk.InputPurpose.FREE_FORM)
+
+        try:
+            font_desc = Pango.FontDescription.from_string("DejaVu Sans 11")
+            self.text_view.override_font(font_desc)
+        except:
+            try:
+                self.text_view.override_font(Pango.FontDescription.from_string("Sans 11"))
+            except:
+                pass
+
         scroll.set_child(self.text_view)
         main_box.append(scroll)
 
+        # Enter to speak (Shift+Enter for newline)
         key_ctrl = Gtk.EventControllerKey()
         key_ctrl.connect("key-pressed", self.on_textview_key_pressed)
         self.text_view.add_controller(key_ctrl)
 
+        # Audio Settings
         audio_exp = Gtk.Expander(label="Audio Settings", expanded=False)
         audio_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
         audio_box.set_margin_top(12)
@@ -66,6 +89,7 @@ class PiperUI(Gtk.Application):
         audio_exp.set_child(audio_box)
         main_box.append(audio_exp)
 
+        # History & Favorites
         hist_exp = Gtk.Expander(label="History & Favorites", expanded=False)
         hist_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
         hist_box.set_margin_top(12)
@@ -96,7 +120,8 @@ class PiperUI(Gtk.Application):
         hist_exp.set_child(hist_box)
         main_box.append(hist_exp)
 
-        btn_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=16)
+        # Action buttons with tip icon
+        btn_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
         btn_box.set_halign(Gtk.Align.CENTER)
         btn_box.set_margin_top(16)
 
@@ -117,10 +142,15 @@ class PiperUI(Gtk.Application):
             self.mute_btn.set_label("Unmute")
             self.mute_btn.add_css_class("destructive-action")
 
+        # Tip button for accents
+        tip_btn = Gtk.Button(label="?")
+        tip_btn.set_tooltip_text("Tip: For languages with accents (á, ã, ç, õ, etc.), install Fcitx5 and make sure is configured to your system.")
+
         btn_box.append(speak_btn)
         btn_box.append(stop_btn)
         btn_box.append(clear_btn)
         btn_box.append(self.mute_btn)
+        btn_box.append(tip_btn)
 
         main_box.append(btn_box)
 
