@@ -144,7 +144,7 @@ class PiperUI(Gtk.Application):
 
         # Tip button for accents
         tip_btn = Gtk.Button(label="?")
-        tip_btn.set_tooltip_text("Tip: For languages with accents (á, ã, ç, õ, etc.), install Fcitx5 and make sure is configured to your system.")
+        tip_btn.set_tooltip_text("Tip: For languages with accents (á, ã, ç, õ, etc.), install fcitx5-gtk")
 
         btn_box.append(speak_btn)
         btn_box.append(stop_btn)
