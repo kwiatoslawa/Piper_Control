@@ -1,6 +1,6 @@
 import gi
 gi.require_version("Gtk", "4.0")
-from gi.repository import Gtk, Pango, Gdk
+from gi.repository import Gtk, Pango, Gdk, GLib
 
 import threading
 from typing import Dict, Any, List
@@ -8,6 +8,7 @@ from typing import Dict, Any, List
 from engine import PiperEngine
 from settings import load_settings, save_settings
 from utils import list_voices, list_audio_sinks
+from web_control import WebControl
 
 
 class PiperUI(Gtk.Application):
@@ -21,10 +22,17 @@ class PiperUI(Gtk.Application):
         self.history: List[str] = self.settings.get("history", [])[:10]
         self.favorites: List[str] = self.settings.get("favorites", [])
 
+        # Phone Control
+        self.web_control = WebControl(
+            tts_callback=self.remote_speak,
+            stop_callback=self.engine.stop
+        )
+        self.phone_status_label = None
+
     def do_activate(self) -> None:
         self.window = Gtk.ApplicationWindow(application=self)
         self.window.set_title("Piper TTS Control")
-        self.window.set_default_size(720, 740)
+        self.window.set_default_size(740, 720)   # Smaller default height
 
         main_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=18)
         main_box.set_margin_top(24)
@@ -32,7 +40,7 @@ class PiperUI(Gtk.Application):
         main_box.set_margin_start(24)
         main_box.set_margin_end(24)
 
-        # Text input area
+        # Text input
         scroll = Gtk.ScrolledWindow(vexpand=True)
         self.text_view = Gtk.TextView()
         self.text_view.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
@@ -43,22 +51,10 @@ class PiperUI(Gtk.Application):
         self.text_view.set_left_margin(12)
         self.text_view.set_right_margin(12)
 
-        self.text_view.set_input_hints(Gtk.InputHints.NONE)
-        self.text_view.set_input_purpose(Gtk.InputPurpose.FREE_FORM)
-
-        try:
-            font_desc = Pango.FontDescription.from_string("DejaVu Sans 11")
-            self.text_view.override_font(font_desc)
-        except:
-            try:
-                self.text_view.override_font(Pango.FontDescription.from_string("Sans 11"))
-            except:
-                pass
-
         scroll.set_child(self.text_view)
         main_box.append(scroll)
 
-        # Enter to speak (Shift+Enter for newline)
+        # Enter to speak
         key_ctrl = Gtk.EventControllerKey()
         key_ctrl.connect("key-pressed", self.on_textview_key_pressed)
         self.text_view.add_controller(key_ctrl)
@@ -120,7 +116,25 @@ class PiperUI(Gtk.Application):
         hist_exp.set_child(hist_box)
         main_box.append(hist_exp)
 
-        # Action buttons with tip icon
+        # Phone Control (now collapsible)
+        phone_exp = Gtk.Expander(label="Phone Control (Remote Access)", expanded=False)
+        phone_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        phone_box.set_margin_top(12)
+        phone_box.set_margin_bottom(12)
+        phone_box.set_margin_start(16)
+        phone_box.set_margin_end(16)
+
+        self.phone_status_label = Gtk.Label(label="Phone Control: Disabled")
+        phone_box.append(self.phone_status_label)
+
+        self.phone_btn = Gtk.ToggleButton(label="Enable Phone Control")
+        self.phone_btn.connect("toggled", self.on_phone_toggled)
+        phone_box.append(self.phone_btn)
+
+        phone_exp.set_child(phone_box)
+        main_box.append(phone_exp)
+
+        # Action buttons
         btn_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
         btn_box.set_halign(Gtk.Align.CENTER)
         btn_box.set_margin_top(16)
@@ -142,7 +156,6 @@ class PiperUI(Gtk.Application):
             self.mute_btn.set_label("Unmute")
             self.mute_btn.add_css_class("destructive-action")
 
-        # Tip button for accents
         tip_btn = Gtk.Button(label="?")
         tip_btn.set_tooltip_text("Tip: For languages with accents (á, ã, ç, õ, etc.), install fcitx5-gtk")
 
@@ -156,6 +169,42 @@ class PiperUI(Gtk.Application):
 
         self.window.set_child(main_box)
         self.window.present()
+
+    def on_phone_toggled(self, button: Gtk.ToggleButton):
+        if button.get_active():
+            if self.web_control.start():
+                button.set_label("Stop Phone Control")
+                button.add_css_class("destructive-action")
+                self._update_phone_status(True)
+            else:
+                button.set_active(False)
+        else:
+            self.web_control.stop()
+            button.set_label("Enable Phone Control")
+            button.remove_css_class("destructive-action")
+            self._update_phone_status(False)
+
+    def _update_phone_status(self, enabled: bool):
+        if self.phone_status_label:
+            if enabled:
+                ip = self.web_control.get_local_ip()
+                port = self.web_control.port
+                self.phone_status_label.set_markup(
+                    f'<span color="#00ff88">🌐 Active → http://{ip}:{port}</span>'
+                )
+            else:
+                self.phone_status_label.set_markup("Phone Control: <span color=\"#aaaaaa\">Disabled</span>")
+
+    def remote_speak(self, text: str):
+        if text and text.strip():
+            GLib.idle_add(self._remote_speak_ui, text.strip())
+
+    def _remote_speak_ui(self, text: str):
+        self.text_view.get_buffer().set_text(text)
+        self.on_speak(None)
+        return False
+
+    # ===================== Helper Methods =====================
 
     def _labeled_row(self, text: str, widget: Gtk.Widget) -> Gtk.Box:
         box = Gtk.Box(spacing=12)
@@ -207,9 +256,7 @@ class PiperUI(Gtk.Application):
         mapping = {}
 
         for name in sinks:
-            if not name:
-                continue
-
+            if not name: continue
             display = name
             if name == "default":
                 display = "System Default"
@@ -270,14 +317,12 @@ class PiperUI(Gtk.Application):
     def _refresh_recent(self):
         while child := self.recent_list.get_first_child():
             self.recent_list.remove(child)
-
         for text in self.history:
             self._add_history_row(self.recent_list, text, favorite=False)
 
     def _refresh_favorites(self):
         while child := self.fav_list.get_first_child():
             self.fav_list.remove(child)
-
         for text in self.favorites:
             self._add_history_row(self.fav_list, text, favorite=True)
 
